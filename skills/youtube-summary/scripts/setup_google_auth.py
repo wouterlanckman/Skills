@@ -2,8 +2,7 @@
 """
 One-time setup and verification script for the youtube-summary skill:
 1. Generates `google_token.json` from `google_credentials.json` via OAuth 2.0.
-   Works seamlessly on a headless Raspberry Pi over SSH (copy-paste redirect URL)
-   or locally with a browser (--local-server).
+   Uses a direct, dependency-free HTTP token exchange without PKCE/line-wrap issues.
 2. Verifies access to your existing Google Drive folder (`YOUTUBE_DRIVE_FOLDER_ID`)
    and existing NotebookLM Master Google Doc (`YOUTUBE_MASTER_DOC_ID`).
 """
@@ -11,10 +10,13 @@ One-time setup and verification script for the youtube-summary skill:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import sys
-from urllib.parse import parse_qs, urlparse
+import urllib.error
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
+import urllib.request
 
 
 SCOPES = [
@@ -50,35 +52,53 @@ def load_dotenv_simple(env_path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("'").strip('"'))
 
 
-def run_ssh_copy_paste_oauth(flow, port: int):
+def run_direct_ssh_oauth(creds_path: Path, port: int):
     """
-    Headless-friendly OAuth flow for Raspberry Pi over SSH:
-    Prints the Google login URL, lets the user approve in any browser, and accepts
-    either the redirected `http://localhost:8085/?...` URL or the raw `code=` parameter.
+    Direct OAuth 2.0 authorization-code exchange for headless Raspberry Pi over SSH.
+    Avoids oauthlib PKCE state/verifier mismatches and terminal indentation wrapping.
     """
-    redirect_uri = f"http://localhost:{port}/"
-    flow.redirect_uri = redirect_uri
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-        include_granted_scopes="true",
-    )
+    from google.oauth2.credentials import Credentials  # noqa: PLC0415
+
+    raw_cfg = json.loads(creds_path.read_text(encoding="utf-8"))
+    client_cfg = raw_cfg.get("installed") or raw_cfg.get("web")
+    if not client_cfg:
+        raise ValueError(
+            f"Invalid {creds_path.name}: expected 'installed' or 'web' key in JSON."
+        )
+
+    client_id = client_cfg["client_id"].strip()
+    client_secret = client_cfg["client_secret"].strip()
+    auth_uri = client_cfg.get("auth_uri", "https://accounts.google.com/o/oauth2/v2/auth")
+    token_uri = client_cfg.get("token_uri", "https://oauth2.googleapis.com/token")
+    redirect_uri = f"http://localhost:{port}"
+
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    auth_url = f"{auth_uri}?{urlencode(params)}"
 
     print("\n" + "=" * 76)
     print("🔐 GOOGLE OAUTH 2.0 SETUP (HEADLESS / SSH MODE)")
     print("=" * 76)
-    print("\n1️⃣  Open this link in your browser on your PC/phone:\n")
-    print(f"    {auth_url}\n")
-    print("2️⃣  Log in with your Google account and click 'Continue' / 'Allow'.")
+    print("\n1️⃣  Open this link in your browser (printed with no leading spaces):\n")
+    print(auth_url)
+    print("\n2️⃣  Log in with your Google account and click 'Continue' / 'Allow'.")
     print(
-        f"3️⃣  Your browser will redirect to http://localhost:{port}/... and may show\n"
+        f"3️⃣  Your browser will redirect to {redirect_uri}/?code=... and show\n"
         "    'This site can’t be reached' — THAT IS NORMAL!\n"
-        "    Simply copy the ENTIRE address bar URL from your browser and paste it below.\n"
+        "    Copy the ENTIRE address bar URL from your browser and paste it below.\n"
     )
     user_input = input("📋 Paste the redirected localhost URL (or code) here: ").strip()
 
+    actual_redirect_uri = redirect_uri
     if user_input.startswith("http://") or user_input.startswith("https://"):
         parsed = urlparse(user_input)
+        # Preserve exact trailing-slash presence if browser/Google used one, though token endpoint requires exact match with auth request
         qs = parse_qs(parsed.query)
         code_list = qs.get("code")
         if not code_list:
@@ -86,12 +106,44 @@ def run_ssh_copy_paste_oauth(flow, port: int):
                 "No '?code=...' parameter found in the URL you pasted. "
                 "Make sure you copied the full URL from the browser's address bar after clicking Allow."
             )
-        code = code_list[0]
+        code = code_list[0].strip()
     else:
-        code = user_input
+        code = unquote(user_input.strip())
 
-    flow.fetch_token(code=code)
-    return flow.credentials
+    post_data = urlencode(
+        {
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": actual_redirect_uri,
+            "grant_type": "authorization_code",
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        token_uri,
+        data=post_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            token_data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Google token endpoint returned HTTP {exc.code}: {err_body}\n"
+            f"(Debug info: client_id={client_id[:18]}..., redirect_uri={actual_redirect_uri}, code_prefix={code[:10]}...)"
+        ) from exc
+
+    return Credentials(
+        token=token_data["access_token"],
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_uri,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=SCOPES,
+    )
 
 
 def main() -> int:
@@ -117,11 +169,6 @@ def main() -> int:
         default=8085,
         help="Redirect port (default: 8085)",
     )
-    parser.add_argument(
-        "--local-server",
-        action="store_true",
-        help="Use a local callback webserver instead of the SSH copy-paste flow",
-    )
     args = parser.parse_args()
 
     skill_dir = Path(__file__).resolve().parent.parent
@@ -139,7 +186,6 @@ def main() -> int:
 
     from google.auth.transport.requests import Request  # noqa: PLC0415
     from google.oauth2.credentials import Credentials  # noqa: PLC0415
-    from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: PLC0415
     from googleapiclient.discovery import build  # noqa: PLC0415
 
     creds = None
@@ -158,19 +204,11 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 1
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(creds_path),
-                SCOPES,
-                autogenerate_code_verifier=False,
-            )
-            if args.local_server:
-                creds = flow.run_local_server(
-                    port=args.port,
-                    access_type="offline",
-                    prompt="consent",
-                )
-            else:
-                creds = run_ssh_copy_paste_oauth(flow, port=args.port)
+            try:
+                creds = run_direct_ssh_oauth(creds_path, port=args.port)
+            except Exception as exc:
+                print(f"\n❌ OAuth token exchange failed: {exc}", file=sys.stderr)
+                return 1
 
         token_path.parent.mkdir(parents=True, exist_ok=True)
         token_path.write_text(creds.to_json(), encoding="utf-8")
