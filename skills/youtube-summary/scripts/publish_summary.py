@@ -589,14 +589,15 @@ def main() -> int:
     master_doc_id = (
         args.master_doc_id or os.environ.get("YOUTUBE_MASTER_DOC_ID", "").strip()
     )
-    token_file = Path(
-        os.environ.get("GOOGLE_TOKEN_FILE", str(base_dir / "google_token.json"))
-    )
-    creds_file = Path(
-        os.environ.get(
-            "GOOGLE_CREDENTIALS_FILE", str(base_dir / "google_credentials.json")
-        )
-    )
+    skill_dir = Path(__file__).resolve().parent.parent
+    raw_token = os.environ.get("GOOGLE_TOKEN_FILE", "google_token.json").strip()
+    raw_creds = os.environ.get("GOOGLE_CREDENTIALS_FILE", "google_credentials.json").strip()
+    token_file = Path(raw_token) if Path(raw_token).is_absolute() else (skill_dir / raw_token)
+    creds_file = Path(raw_creds) if Path(raw_creds).is_absolute() else (skill_dir / raw_creds)
+    if not token_file.exists() and (skill_dir / "google_token.json").exists():
+        token_file = skill_dir / "google_token.json"
+    if not creds_file.exists() and (skill_dir / "google_credentials.json").exists():
+        creds_file = skill_dir / "google_credentials.json"
 
     if not folder_id:
         print(

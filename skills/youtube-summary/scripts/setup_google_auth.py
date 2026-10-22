@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 One-time setup and verification script for the youtube-summary skill:
-1. Runs the OAuth 2.0 flow using `google_credentials.json` and saves `google_token.json`.
+1. Generates `google_token.json` from `google_credentials.json` via OAuth 2.0.
+   Works seamlessly on a headless Raspberry Pi over SSH (copy-paste redirect URL)
+   or locally with a browser (--local-server).
 2. Verifies access to your existing Google Drive folder (`YOUTUBE_DRIVE_FOLDER_ID`)
    and existing NotebookLM Master Google Doc (`YOUTUBE_MASTER_DOC_ID`).
 """
@@ -12,6 +14,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+from urllib.parse import parse_qs, urlparse
 
 
 SCOPES = [
@@ -47,6 +50,50 @@ def load_dotenv_simple(env_path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("'").strip('"'))
 
 
+def run_ssh_copy_paste_oauth(flow, port: int):
+    """
+    Headless-friendly OAuth flow for Raspberry Pi over SSH:
+    Prints the Google login URL, lets the user approve in any browser, and accepts
+    either the redirected `http://localhost:8085/?...` URL or the raw `code=` parameter.
+    """
+    redirect_uri = f"http://localhost:{port}/"
+    flow.redirect_uri = redirect_uri
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        include_granted_scopes="true",
+    )
+
+    print("\n" + "=" * 76)
+    print("🔐 GOOGLE OAUTH 2.0 SETUP (HEADLESS / SSH MODE)")
+    print("=" * 76)
+    print("\n1️⃣  Open this link in your browser on your PC/phone:\n")
+    print(f"    {auth_url}\n")
+    print("2️⃣  Log in with your Google account and click 'Continue' / 'Allow'.")
+    print(
+        f"3️⃣  Your browser will redirect to http://localhost:{port}/... and may show\n"
+        "    'This site can’t be reached' — THAT IS NORMAL!\n"
+        "    Simply copy the ENTIRE address bar URL from your browser and paste it below.\n"
+    )
+    user_input = input("📋 Paste the redirected localhost URL (or code) here: ").strip()
+
+    if user_input.startswith("http://") or user_input.startswith("https://"):
+        parsed = urlparse(user_input)
+        qs = parse_qs(parsed.query)
+        code_list = qs.get("code")
+        if not code_list:
+            raise ValueError(
+                "No '?code=...' parameter found in the URL you pasted. "
+                "Make sure you copied the full URL from the browser's address bar after clicking Allow."
+            )
+        code = code_list[0]
+    else:
+        code = user_input
+
+    flow.fetch_token(code=code)
+    return flow.credentials
+
+
 def main() -> int:
     ensure_venv()
     parser = argparse.ArgumentParser(
@@ -68,32 +115,32 @@ def main() -> int:
         "--port",
         type=int,
         default=8085,
-        help="Local port for OAuth callback server (use SSH port forwarding -L 8085:localhost:8085 if running directly on Raspberry Pi)",
+        help="Redirect port (default: 8085)",
+    )
+    parser.add_argument(
+        "--local-server",
+        action="store_true",
+        help="Use a local callback webserver instead of the SSH copy-paste flow",
     )
     args = parser.parse_args()
 
+    skill_dir = Path(__file__).resolve().parent.parent
     load_dotenv_simple(Path.cwd() / ".env")
-    load_dotenv_simple(Path(__file__).resolve().parent.parent / ".env")
+    load_dotenv_simple(skill_dir / ".env")
 
-    creds_path = args.credentials or Path(
-        os.environ.get("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
-    )
-    token_path = args.token or Path(
-        os.environ.get("GOOGLE_TOKEN_FILE", "google_token.json")
-    )
+    raw_creds = os.environ.get("GOOGLE_CREDENTIALS_FILE", "google_credentials.json").strip()
+    raw_token = os.environ.get("GOOGLE_TOKEN_FILE", "google_token.json").strip()
+    default_creds = Path(raw_creds) if Path(raw_creds).is_absolute() else (skill_dir / raw_creds)
+    default_token = Path(raw_token) if Path(raw_token).is_absolute() else (skill_dir / raw_token)
+    if not default_creds.exists() and (skill_dir / "google_credentials.json").exists():
+        default_creds = skill_dir / "google_credentials.json"
+    creds_path = args.credentials or default_creds
+    token_path = args.token or default_token
 
-    try:
-        from google.auth.transport.requests import Request  # noqa: PLC0415
-        from google.oauth2.credentials import Credentials  # noqa: PLC0415
-        from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: PLC0415
-        from googleapiclient.discovery import build  # noqa: PLC0415
-    except ImportError as exc:
-        print(
-            f"❌ Missing Google Auth libraries: {exc}\n"
-            "Install with: .venv/bin/pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib",
-            file=sys.stderr,
-        )
-        return 1
+    from google.auth.transport.requests import Request  # noqa: PLC0415
+    from google.oauth2.credentials import Credentials  # noqa: PLC0415
+    from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: PLC0415
+    from googleapiclient.discovery import build  # noqa: PLC0415
 
     creds = None
     if token_path.exists():
@@ -107,23 +154,23 @@ def main() -> int:
             if not creds_path.exists():
                 print(
                     f"❌ OAuth Client file not found at: {creds_path}\n"
-                    "Download your Desktop App OAuth JSON from Google Cloud Console and save it there.",
+                    "Save your downloaded Desktop App OAuth JSON there first.",
                     file=sys.stderr,
                 )
                 return 1
-            print(
-                f"🌐 Starting OAuth 2.0 login on http://localhost:{args.port} ...\n"
-                "   (Tip: If running via SSH on your Raspberry Pi, connect with: ssh -L 8085:localhost:8085 pi@<ip>)"
-            )
             flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
-            creds = flow.run_local_server(
-                port=args.port,
-                access_type="offline",
-                prompt="consent",
-            )
+            if args.local_server:
+                creds = flow.run_local_server(
+                    port=args.port,
+                    access_type="offline",
+                    prompt="consent",
+                )
+            else:
+                creds = run_ssh_copy_paste_oauth(flow, port=args.port)
+
         token_path.parent.mkdir(parents=True, exist_ok=True)
         token_path.write_text(creds.to_json(), encoding="utf-8")
-        print(f"✅ Saved OAuth token (with refresh_token) to: {token_path.resolve()}")
+        print(f"\n✅ Saved OAuth token (with refresh_token) to: {token_path.resolve()}")
 
     drive_service = build("drive", "v3", credentials=creds)
     docs_service = build("docs", "v1", credentials=creds)
@@ -131,7 +178,7 @@ def main() -> int:
     folder_id = os.environ.get("YOUTUBE_DRIVE_FOLDER_ID", "").strip()
     master_doc_id = os.environ.get("YOUTUBE_MASTER_DOC_ID", "").strip()
 
-    if folder_id:
+    if folder_id and folder_id != "your_drive_folder_id_here":
         try:
             f_meta = (
                 drive_service.files()
@@ -155,7 +202,7 @@ def main() -> int:
     else:
         print("ℹ️ YOUTUBE_DRIVE_FOLDER_ID is not yet set in .env.")
 
-    if master_doc_id:
+    if master_doc_id and master_doc_id != "your_master_google_doc_id_here":
         try:
             doc_meta = (
                 docs_service.documents().get(documentId=master_doc_id).execute()
