@@ -158,7 +158,11 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 1
-            flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(creds_path),
+                SCOPES,
+                autogenerate_code_verifier=False,
+            )
             if args.local_server:
                 creds = flow.run_local_server(
                     port=args.port,
