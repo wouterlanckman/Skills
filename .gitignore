@@ -1,0 +1,21 @@
+# Secrets & Environment Variables (NEVER commit)
+.env
+*.env
+*credentials*.json
+*token*.json
+client_secret*.json
+
+# Temporary workspaces & artifacts
+temp_workspace/
+*.tmp
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# OS / Editor files
+.DS_Store
+*.swp

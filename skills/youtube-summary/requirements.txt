@@ -1,0 +1,12 @@
+# YouTube metadata & caption extraction
+yt-dlp>=2025.1.0
+youtube-transcript-api>=1.0.0
+
+# Automatic audio fallback transcription (when video has captions disabled)
+google-genai>=1.0.0
+
+# Google Drive v3 & Google Docs v1 publishing
+google-api-python-client>=2.150.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
+markdown>=3.6
