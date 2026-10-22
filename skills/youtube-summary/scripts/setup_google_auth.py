@@ -20,6 +20,22 @@ SCOPES = [
 ]
 
 
+def ensure_venv() -> None:
+    """Automatically re-exec inside the skill or repo .venv if invoked with system python."""
+    if os.environ.get("_AGY_VENV_ACTIVE") == "1":
+        return
+    script_dir = Path(__file__).resolve().parent
+    skill_dir = script_dir.parent
+    repo_dir = skill_dir.parent.parent
+    for candidate_venv in (skill_dir / ".venv", repo_dir / ".venv", Path.cwd() / ".venv"):
+        venv_python = candidate_venv / "bin" / "python"
+        if venv_python.is_file() and os.access(venv_python, os.X_OK):
+            if Path(sys.prefix).resolve() != candidate_venv.resolve():
+                os.environ["_AGY_VENV_ACTIVE"] = "1"
+                os.execv(str(venv_python), [str(venv_python), *sys.argv])
+            return
+
+
 def load_dotenv_simple(env_path: Path) -> None:
     if not env_path.exists():
         return
@@ -32,6 +48,7 @@ def load_dotenv_simple(env_path: Path) -> None:
 
 
 def main() -> int:
+    ensure_venv()
     parser = argparse.ArgumentParser(
         description="Authenticate Google Drive & Docs API and verify existing Folder & Master Doc IDs."
     )
